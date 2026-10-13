@@ -930,7 +930,7 @@ function collapse(s: string): string {
  *
  * Keyless, no signup, no login on either side of the call.
  */
-import type { ArTitleRow, ArSectionRow } from './ar-index-data.js';
+import type { ArTitleRow, ArSectionRow, ArLaterActRow } from './ar-index-data.js';
 
 // fleet #2754: a baked index must never be a value import — that puts the
 // whole table into every gateway isolate's module scope whether or not it
@@ -960,6 +960,79 @@ function ensureIndex(args: Record<string, unknown>): void {
   }
   AR_SECTIONS = sections as ArSectionRow[];
   AR_INDEX_CAPTURED_AT = capturedAt;
+}
+
+// LATER-ACTS OVERLAY (fleet #2906, first of the AR/MS/TN overlay builds —
+// docs/current-statute-routes.md, #2902). Baked from the Arkansas General
+// Assembly's own Code-Sections-Amended index (arkleg.state.ar.us/Acts/
+// CodeSection) by scripts/bake-later-acts.mjs — see that script's header for
+// the full sourcing story. This is an OVERLAY, never a merge: ar_statute's
+// `text` field stays the frozen Release 78 (2020-11-06) snapshot; this table
+// only adds a dated, linked list of later acts beside it, explicitly labelled
+// as not merged into that text.
+let AR_LATER_ACTS: ArLaterActRow[] = [];
+let AR_LATER_ACTS_CAPTURED_AT = '';
+let AR_LATER_ACTS_SESSIONS_CHECKED: string[] = [];
+let AR_LATER_ACTS_LOADED = false;
+
+function ensureLaterActs(args: Record<string, unknown>): void {
+  if (AR_LATER_ACTS_LOADED) return;
+  const idx = args._bakedIndex as Record<string, unknown> | null | undefined;
+  const rows = idx?.AR_LATER_ACTS;
+  const capturedAt = idx?.AR_LATER_ACTS_CAPTURED_AT;
+  const sessionsChecked = idx?.AR_LATER_ACTS_SESSIONS_CHECKED;
+  if (
+    !Array.isArray(rows) ||
+    rows.length === 0 ||
+    typeof capturedAt !== 'string' ||
+    !Array.isArray(sessionsChecked) ||
+    sessionsChecked.length === 0
+  ) {
+    // Loud, same shape as ensureIndex() above: a missing/malformed overlay
+    // index is a server-side KV fault, not evidence the section has no later
+    // acts. ar_statute must not silently claim later_acts: [] when the real
+    // answer is "the index did not load" — those are different failures and
+    // collapsing them would be exactly the silent-empty-array trap this
+    // fleet holds every pack to (docs/silent-zero-policy.md).
+    throw new Error(
+      `arkansas-code: the baked later-acts overlay index is unavailable (${idx == null ? 'not injected' : 'malformed'}). ` +
+        'The gateway loads it from KV on the first call into this pack; this is a server-side fault, not "no later acts" — retry shortly.',
+    );
+  }
+  AR_LATER_ACTS = rows as ArLaterActRow[];
+  AR_LATER_ACTS_CAPTURED_AT = capturedAt;
+  AR_LATER_ACTS_SESSIONS_CHECKED = sessionsChecked as string[];
+  AR_LATER_ACTS_LOADED = true;
+}
+
+interface LaterAct {
+  act_number: number;
+  session: string;
+  date: null;
+  link: string;
+  bill: string | null;
+  flags: string[];
+  source: 'arkleg';
+  merged: false;
+}
+
+function laterActsFor(citation: string): LaterAct[] {
+  return AR_LATER_ACTS.filter(([cite]) => cite === citation).map(
+    ([, actNumber, , sessionLabel, flags, bill, pdfUrl]) => ({
+      act_number: actNumber,
+      session: sessionLabel,
+      // The arkleg index gives session + act number + PDF link, not a
+      // per-act enactment date (that line lives inside each act's own PDF,
+      // not in this index) — null, honestly, rather than guessing a date
+      // from the session's year.
+      date: null,
+      link: pdfUrl,
+      bill: bill || null,
+      flags: flags ? flags.split(',') : [],
+      source: 'arkleg',
+      merged: false,
+    }),
+  );
 }
 
 const UA = 'pipeworx-mcp-arkansas-code/1.0 (+https://pipeworx.io)';
@@ -1182,8 +1255,11 @@ const tools: McpToolExport['tools'] = [
       'excluded (can run to hundreds of KB per heavily-litigated section). SOURCED FROM A 2020-11-06 RELEASE OF A ' +
       'PUBLIC-DOMAIN SOURCE — the official LexisNexis portal requires passing an authentication/CAPTCHA wall, so ' +
       'this is the newest free, non-walled text found; every response carries data_as_of and a staleness warning. ' +
-      'Use for "what does ACA 5-10-101 say" or to check an Arkansas statute, with the caveat that amendments after ' +
-      '2020-11-06 will not show. Keyless.',
+      'Also returns later_acts: a dated, linked overlay of every act the Arkansas legislature\'s OWN Code-Sections-' +
+      'Amended index shows touching this exact citation since the 2020-11-06 snapshot (act number, session, PDF ' +
+      'link) — NOT merged into the text, explicitly labelled so, with sessions_checked naming every session the ' +
+      'index covers even when later_acts is empty. Use for "what does ACA 5-10-101 say" or to check an Arkansas ' +
+      'statute AND whether it has been amended since 2020-11-06. Keyless.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1220,6 +1296,7 @@ async function arStatute(args: Record<string, unknown>) {
     return { found: false, reason: 'empty_citation', message: 'ar_statute needs a citation, e.g. "5-10-101" or "Ark. Code Ann. 4-70-101".' };
   }
   const citation = normalizeCitation(raw);
+  ensureLaterActs(args);
   const title = titleOfCitation(citation);
   if (title === null || title < 1 || title > TITLE_COUNT) {
     return {
@@ -1244,6 +1321,7 @@ async function arStatute(args: Record<string, unknown>) {
 
   const sliced = sliceSection(html, citation);
   if (!sliced) {
+    const laterActsForMissing = laterActsFor(citation);
     return {
       found: false,
       reason: 'citation_not_found',
@@ -1252,12 +1330,18 @@ async function arStatute(args: Record<string, unknown>) {
       title_name: titleName(title),
       message: `No section matches "${raw}" in Title ${title}${titleName(title) ? ` (${titleName(title)})` : ''} of the Arkansas Code (Release 78).`,
       near: nearbyCitations(html, title, 5),
-      hint: 'It may be a chapter heading rather than a section, be numbered differently than expected, or postdate Release 78 (2020-11-06). Call ar_search instead to browse by topic.',
+      hint: laterActsForMissing.length
+        ? `This citation does not appear in the Release 78 (2020-11-06) snapshot, but the Arkansas legislature's own Code-Sections-Amended index shows ${laterActsForMissing.length} later act(s) touching it — it may be a section CREATED after the snapshot date. See later_acts_if_created below (not merged text, just the act references).`
+        : 'It may be a chapter heading rather than a section, be numbered differently than expected, or postdate Release 78 (2020-11-06). Call ar_search instead to browse by topic.',
+      later_acts_if_created: laterActsForMissing,
+      sessions_checked: AR_LATER_ACTS_SESSIONS_CHECKED,
       source_url: url,
       source: SOURCE_LABEL,
       current_through: CURRENT_THROUGH,
     };
   }
+
+  const laterActs = laterActsFor(citation);
 
   return {
     found: true,
@@ -1271,6 +1355,20 @@ async function arStatute(args: Record<string, unknown>) {
     notes: sliced.notesText,
     case_law_annotations_omitted: sliced.truncatedForCaseLaw,
     historical_versions: 'not available — this source publishes only the Release 78 (2020-11-06) text; no prior-version archive is exposed by it.',
+    // OVERLAY (fleet #2906): acts that touched this exact citation AFTER the
+    // 2020-11-06 snapshot, per the Arkansas legislature's own Code-Sections-
+    // Amended index. NOT MERGED into `text` above — the snapshot text is
+    // unchanged by this list; it is only told alongside it. Empty means the
+    // index shows no later act for this citation across every session
+    // checked (named in sessions_checked below), not that the index failed —
+    // ensureLaterActs() above throws loudly if the index itself is missing.
+    later_acts: laterActs,
+    later_acts_merged_into_text: false,
+    sessions_checked: AR_LATER_ACTS_SESSIONS_CHECKED,
+    later_acts_data_as_of: AR_LATER_ACTS_CAPTURED_AT,
+    later_acts_note: laterActs.length
+      ? `${laterActs.length} later act(s) found via arkleg's own Code-Sections-Amended index. These are NOT merged into the text above — the text is still the frozen Release 78 (2020-11-06) snapshot. Open the act PDF (link field) for the actual amending language.`
+      : `No later act found for this citation across every session checked since the 2020-11-06 snapshot (${AR_LATER_ACTS_SESSIONS_CHECKED.join('; ')}). This does not guarantee the text is unchanged — only that arkleg's own index, which is itself official and keyless, lists no act against this exact citation.`,
     source_url: url,
     source: SOURCE_LABEL,
     current_through: CURRENT_THROUGH,

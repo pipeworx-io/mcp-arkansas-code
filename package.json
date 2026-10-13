@@ -1,7 +1,7 @@
 {
   "name": "@pipeworx/mcp-arkansas-code",
-  "version": "0.1.0",
-  "description": "Arkansas Code of 1987 — state statutes by citation and by topic search.",
+  "version": "0.1.1",
+  "description": "Arkansas Code of 1987 — state statutes by citation and by topic search. Fleet #2881, closing the 50-state gap (Arkansas was one of 4 states with no <state>-code pack; Mississippi now has one too — #2883 — New Mexico and Tennessee remain).",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-b7e9f0080772b179a509885734be9e6127273e40638c415fa5aa471f57c8a89e",
-    "sourceCommit": "051ee2039fc96224cb5b7358fd69d525bced13a6"
+    "sourceHash": "v1-e06fce3702a4319b331b22db6bd089dbd82d1352837c5f93be82808e73de5593",
+    "sourceCommit": "3723e46c6d115bd4a1fd2175e6bf758555e7cb50"
   }
 }

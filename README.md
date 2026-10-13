@@ -4,16 +4,19 @@ Arkansas Code of 1987 — section lookup by citation, and topic/keyword search
 over official catchlines. Fleet #2881, one of the four remaining states with
 no `<state>-code` pack (Mississippi now has one too — fleet #2883). Keyless.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1763+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1784+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
 - `ar_statute(citation)` — the text of one Ark. Code Ann. section by
   citation (`"5-10-101"`, capital murder; `"4-70-101"`; `"Ark. Code Ann. §
   5-10-101"`). Returns the catchline, the operative statutory text, the
-  `History.` line (the Acts that enacted/amended it), and other legislative
-  notes when present. Case-law annotations are deliberately excluded — they
-  can run to hundreds of KB per heavily-litigated section.
+  `History.` line (the Acts that enacted/amended it), other legislative notes
+  when present, AND a `later_acts` overlay — every act the Arkansas
+  legislature's own index shows touching this exact citation since the
+  2020-11-06 snapshot (fleet #2906, see "The overlay" below). Case-law
+  annotations are deliberately excluded — they can run to hundreds of KB per
+  heavily-litigated section.
 - `ar_search(query, limit?)` — topic/keyword search over official section
   catchlines across all 28 titles (e.g. `"capital murder"`, `"security
   deposit"`). Not full-text search — see "Known gaps".
@@ -64,6 +67,70 @@ pointed at this newer UniCourt mirror, 8+ years fresher; the switch is
 confirmed live: Ark. Code Ann. § 5-10-101's `History.` line now runs through
 "2019, No. 910, § 666" versus 2011 in the old source.)
 
+## The overlay: later acts, never merged (fleet #2906)
+
+Bruce kept `ar_statute` on the frozen 2020-11-06 snapshot ("we'll need to
+figure something out") rather than chase a fully reconciled current code.
+This overlay is the cheapest honest improvement on top of that decision —
+design and measurements in `docs/current-statute-routes.md` (#2902) — and is
+the first of three planned (Mississippi and Tennessee follow with their own
+home-built indexes once this proves out).
+
+**The rule: never rewrite the snapshot `text`. Only ever ADD a dated, linked
+list beside it, explicitly labelled as not merged.** `ar_statute`'s response
+carries:
+
+- `later_acts` — one entry per act that touched this exact citation since
+  the snapshot date: `act_number`, `session` (human-readable, e.g. "2025 -
+  Regular Session, 2025"), `link` (the act's own PDF), `bill` (the measure
+  number), `flags` (any subset of `EC`/`RP`/`NS`/`RN` — Emergency Clause /
+  Repealed / New Section / Renumbered), `source: "arkleg"`, and
+  `merged: false`. Empty (`[]`) means the index shows no later act for this
+  citation across every session checked — not that the overlay failed to
+  load (a missing/malformed KV index throws loudly instead, same as
+  `ar_search`'s catchline index below).
+- `sessions_checked` — every biennium/session the index covers, named even
+  when `later_acts` is empty, so a caller can tell "nothing changed" from
+  "we didn't check."
+- `later_acts_data_as_of` — when the overlay was last baked.
+- `date: null` on every act entry, **honestly** — the source index gives
+  session + act number + PDF link, not a per-act enactment date (that line
+  lives inside each act's own PDF, not in the index); guessing a date from
+  the session's year would be worse than saying so.
+
+**Source**: the Arkansas General Assembly's own "Code Sections Amended" tool
+(`arkleg.state.ar.us/Acts/CodeSectionsAmended`) calls a keyless endpoint —
+`/Acts/CodeSection?section=<title>&ddBienniumSession=<session>` — that
+returns every citation touched in a biennium/session: the citation, the
+amending Act's number and PDF link, EC/RP/NS/RN flags, and the bill number.
+Confirmed live and from a throwaway `wrangler dev --remote` edge probe on the
+prod Cloudflare account (2026-10-09/10): byte-identical to a laptop `curl`,
+HTTP 200, no bot wall, no JS rendering required. We are calling the index the
+state already maintains — the proxy shape (`mirror-needs-grant-proxy-does-
+not` in root CLAUDE.md), same as `ar_statute`'s own live fetch above.
+
+**A section not found in the Release-78 snapshot but present in the overlay**
+is flagged specially: `ar_statute`'s `found: false` response carries
+`later_acts_if_created` — if the legislature's index shows acts against a
+citation that does not exist in the 2020 snapshot, that is a signal the
+section may have been CREATED after the snapshot date, not necessarily a bad
+citation.
+
+**For Mississippi and Tennessee (next): reuse, don't re-derive.** Arkansas is
+the cheap case because the legislature publishes the citation→act index
+directly — Mississippi and Tennessee do not (per docs/current-statute-
+routes.md), so their overlays need a home-built index crawled from signed-
+bill text instead of one state-maintained endpoint. What DOES carry over
+directly: the response shape (`later_acts`/`sessions_checked`/
+`later_acts_merged_into_text: false`/the "never rewrite text" rule), the
+baked-index + KV injection pattern (append new exports to the SAME
+`src/<xx>-index-data.ts` file the catchline index already uses — one file per
+pack slug in `pack-baked-indexes.json`, not a second registry entry), the
+session-discovery-over-hardcoding trick (read the live `<select>` rather than
+a fixed session list, so the index self-extends as new sessions are held),
+and the `scripts/bake-later-acts.mjs` → `scripts/<xx>-later-acts-refresh.yml`
+shape for the refresh workflow.
+
 ## Known gaps
 
 - `ar_search` matches official catchlines only, not full statutory text —
@@ -74,20 +141,39 @@ confirmed live: Ark. Code Ann. § 5-10-101's `History.` line now runs through
   (or pre-2012) version of a section's text is not published anywhere free
   that was found.
 
-## Refreshing the search index
+## Refreshing the baked indexes
 
-`ar_search` reads a baked catchline index (`src/ar-index-data.ts`, 37,369
-rows across 28 titles), injected from KV via
-`workers/gateway/src/pack-baked-indexes.json` rather than bundled (fleet
-#2754: a value-imported multi-MB table loads into every gateway isolate
-whether or not it ever serves this pack). Rebuild it with:
+`src/ar-index-data.ts` carries TWO independently-baked tables, both injected
+from KV via `workers/gateway/src/pack-baked-indexes.json` as one combined
+`_bakedIndex` object rather than bundled (fleet #2754: a value-imported
+multi-MB table loads into every gateway isolate whether or not it ever
+serves this pack):
+
+- `AR_SECTIONS`/`AR_TITLES` — `ar_search`'s catchline index, 37,369 rows
+  across 28 titles. Rebuild with `node scripts/bake-index.mjs >
+  src/ar-index-data.ts` (OVERWRITES the file — see below). Re-run only if
+  `unicourt.github.io/cic-code-ar` publishes a release newer than 78.
+- `AR_LATER_ACTS`/`AR_LATER_ACTS_SESSIONS_CHECKED` — `ar_statute`'s overlay
+  index (fleet #2906), ~8,900 rows across the 12 sessions held since
+  2020-11-06. Rebuild with `node scripts/bake-later-acts.mjs >>
+  src/ar-index-data.ts` (APPENDS). Re-run after every Arkansas legislative
+  session adjourns and Acts are signed — see
+  `.github/workflows/arkansas-later-acts-refresh.yml` for the scheduled
+  version. Session discovery is automatic (reads the live `<select>` on
+  `arkleg.state.ar.us/Acts/SearchByRange`), so a new session shows up with no
+  code change.
+
+**Full regen (both tables)**:
 
 ```bash
 node scripts/bake-index.mjs > src/ar-index-data.ts
+node scripts/bake-later-acts.mjs >> src/ar-index-data.ts
 ```
 
-Re-run only if `unicourt.github.io/cic-code-ar` publishes a release newer
-than 78.
+Run `node ../../scripts/check-baked-indexes.mjs` after either (from the repo
+root) — it dynamically imports the regenerated file the same way the KV
+uploader does, and refuses an empty exported array before it ever reaches
+deploy.
 
 ## Quick Start
 
@@ -133,7 +219,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1763+ data sources. The
+Both URLs reach the same gateway and the same 1784+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
